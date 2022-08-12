@@ -1,0 +1,4 @@
+name = "action-logger"
+main = "src/index.ts"
+compatibility_date = "2022-08-11"
+vars = { LogDNA = "ca01889af25d381ab9492f4dc28fe73e" }
