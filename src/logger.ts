@@ -6,6 +6,8 @@ interface LogData {
   app: string
   env: string
   source?: string | null
+  target?: string | null
+  [key: string]: unknown
   meta: {
     source?: string | null
     ua?: string | null
@@ -34,7 +36,7 @@ const stringify = (obj: unknown) => safeStringify(obj)
 export class Logger {
   #key: string
   #hostname: string
-  #tagName?: string
+  #tags: string[]
   requestStartTime: number
   defaultLogData: LogData
   metaDetails: Record<string, unknown>
@@ -42,15 +44,15 @@ export class Logger {
 
   /**
    * Logger constructor
-   * @param {Request} source
+   * @param {Request} origin
    */
-  constructor(key: string, name: string, environment: string, source: Request | ScheduledController, tagName?: string) {
-    const url = source instanceof Request ? new URL(source.url) : null
+  constructor(key: string, name: string, environment?: string, source?: string, origin?: Request | ScheduledController, body?: string, tags?: string) {
+    const url = origin instanceof Request ? new URL(origin.url) : null
     this.#key = key
-    this.#hostname = url?.hostname ?? 'cronjob'
-    this.#tagName = tagName
+    this.#tags = tags?.split(/[ ,]+/).filter(Boolean) || []
+    this.#hostname = url?.hostname ?? 'unknown'
     this.requestStartTime = Date.now()
-    this.defaultLogData = this.buildDefaultLogData(name, environment, source)
+    this.defaultLogData = this.buildDefaultLogData(name, environment, source, origin, body)
     this.metaDetails = {}
     this.logs = []
     this.extendConsole()
@@ -58,40 +60,48 @@ export class Logger {
 
   /**
    * Build up default log data
-   * @param source
+   * @param origin
    * @returns {Object}
    */
-  buildDefaultLogData(name: string, environment: string, source: Request | ScheduledController): LogData {
-    const commonMeta = { source: environment }
+  buildDefaultLogData(name: string, environment: string | undefined, source: string | undefined, origin?: Request | ScheduledController, body?: string): LogData {
+    const url = origin instanceof Request ? new URL(origin.url) : null
+    const commonMeta = { source: source }
     let requestMeta = {}
     let jobMeta = {}
 
-    if (source instanceof Request) {
+    this.#hostname = url?.hostname ?? 'unknown'
+
+    if (origin instanceof Request) {
       requestMeta = {
-        origin: source.headers.get('origin'),
-        ua: source.headers.get('user-agent'),
-        referer: source.headers.get('Referer') || 'empty',
-        ip: source.headers.get('CF-Connecting-IP'),
-        countryCode: (source.cf || {}).country,
-        colo: (source.cf || {}).colo,
-        url: source.url,
-        method: source.method,
-        x_forwarded_for: source.headers.get('x_forwarded_for') || '0.0.0.0',
-        asn: (source.cf || {}).asn,
-        cfRay: source.headers.get('cf-ray'),
-        tlsCipher: (source.cf || {}).tlsCipher,
-        tlsVersion: (source.cf || {}).tlsVersion,
-        clientTrustScore: (source.cf || {}).clientTrustScore,
+        origin: origin.headers.get('origin'),
+        ua: origin.headers.get('user-agent'),
+        referer: origin.headers.get('Referer') || 'empty',
+        ip: origin.headers.get('CF-Connecting-IP'),
+        countryCode: (origin.cf || {}).country,
+        colo: (origin.cf || {}).colo,
+        url: origin.url,
+        method: origin.method,
+        x_forwarded_for: origin.headers.get('x_forwarded_for') || '0.0.0.0',
+        asn: (origin.cf || {}).asn,
+        cfRay: origin.headers.get('cf-ray'),
+        tlsCipher: (origin.cf || {}).tlsCipher,
+        tlsVersion: (origin.cf || {}).tlsVersion,
+        clientTrustScore: (origin.cf || {}).clientTrustScore,
+        headers: Object.fromEntries(origin.headers),
       }
-    } else if ('scheduledTime' in source) {
+    } else if (origin && 'scheduledTime' in origin) {
+      this.#hostname = 'cronjob'
       jobMeta = {
-        timestamp: new Date(source.scheduledTime),
+        timestamp: new Date(origin.scheduledTime),
       }
     }
+
+    this.setMeta('requestBody', body)
 
     return {
       app: name,
       env: environment || 'unknown',
+      source: source,
       meta: { ...commonMeta, ...requestMeta, ...jobMeta },
     }
   }
@@ -141,13 +151,37 @@ export class Logger {
   }
 
   /**
+   * Add a data value to the logs
+   * Done this way so each log that contains the data no matter when its added after
+   * @param {string} dataName
+   * @param {string | number | null | undefined} dataValue
+   */
+  setData(dataName: string, dataValue: string | number | null | undefined): void {
+    if (dataValue === undefined) return
+
+    this.defaultLogData[dataName] = dataValue
+  }
+
+  /**
    * Add a meta value to the logs
    * Done this way so each log that contains the meta data no matter when its added after
    * @param {string} metaName
    * @param {string|number} metaValue
    */
-  setMeta(metaName: string, metaValue: string | number): void {
+  setMeta(metaName: string, metaValue: string | number | null | undefined): void {
+    if (metaValue === undefined) return
+
     this.metaDetails[metaName] = metaValue
+  }
+
+  /**
+   * Add a new tag to the tag list
+   * @param {string} value
+   */
+  setTag(tag: string | undefined): void {
+    if (tag === undefined) return
+
+    this.#tags.push(tag)
   }
 
   extendConsole(): void {
@@ -156,7 +190,7 @@ export class Logger {
     const _workerConsole = { log, debug, error, warn, info }
 
     DEFAULT_CONSOLE_METHODS.forEach((method) => {
-      console[method] = (...args: any[]) => {
+      console[method] = (...args: string[]) => {
         this.addLog(args.length > 1 ? stringify(args) : args[0], method as LogLevel)
 
         _workerConsole[method](...args)
@@ -174,10 +208,16 @@ export class Logger {
   async postRequest(): Promise<void> {
     const token = this.#key
     const hostname = this.#hostname
-    const tagName = this.#tagName
     const time = Date.now()
+    const tags = this.#tags
 
-    const url = `https://logs.logdna.com/logs/ingest?tags=${tagName}&hostname=${hostname}&now=${time}`
+    const paramsObj = tags.map((s) => ['tags', s] as [key: string, value: string])
+    paramsObj.push(['hostname', hostname])
+    paramsObj.push(['time', time.toString()])
+
+    const params = new URLSearchParams(paramsObj)
+
+    const url = `https://logs.logdna.com/logs/ingest?${params}`
 
     // add the executionTime to each of the logs for visibility
     this.logs.forEach((log) => {

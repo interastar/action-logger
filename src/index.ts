@@ -44,29 +44,53 @@ function redirectRequest(request: Request, newHost?: string | null, newPort?: st
   // to clone all the attributes. Applying the URL also requires a constructor
   // since once a Request has been constructed, its URL is immutable.
   //return new Request(url.toString(), new Request(request, newRequestInit));
-  return new Request(url.toString(), new Request(request))
+  //return new Request(url.toString(), new Request(request))
+  return new Request(url.toString(), request.clone())
 }
 
-app.all('/*', (c) => {
+app.all('/*', async (c) => {
   const host = c.req.headers.get('Redirect-Host')
   const port = c.req.headers.get('Redirect-Port')
   const org = c.req.headers.get('Origin-Org')
-  const name = c.req.headers.get('Origin-Name') ?? 'Unknown'
+  const name = c.req.headers.get('Origin-Name') ?? 'action.logger'
+  const source = c.req.headers.get('Origin-Source') ?? 'Genesys'
+  const tags = c.req.headers.get('Origin-Tags') ?? 'Unknown'
+  const debug = c.req.headers.get('Debug-Content') == 'true'
 
-  console.log(JSON.stringify(c.env))
+  const logger = new Logger(c.env.LogDNA, name, undefined, source, undefined, undefined, tags)
 
-  // if (!host) return c.json({ message: 'Missing host' }, 404)
-  if (!org) return c.json({ message: 'Unknown org' }, 404)
-  if (!c.env.LogDNA) return c.json({ message: 'Logging off' }, 500)
+  try {
+    if (debug) console.debug(JSON.stringify(c.env))
 
-  const request = redirectRequest(c.req, host, port)
+    // if (!host) return c.json({ message: 'Missing host' }, 404)
+    if (!org) return c.json({ message: 'Unknown org' }, 404)
+    if (!c.env.LogDNA) return c.json({ message: 'Logging off' }, 500)
 
-  const logger = new Logger(c.env.LogDNA, 'action.logger', org, request, name)
-  console.log(`Action ${name} called from  ${org}`)
+    const request = redirectRequest(c.req, host, port)
+    const logRequest = request.clone() // a copy of the request is now stored in newRequest
+    const requestBody = debug ? await logRequest.text() : undefined
 
-  c.executionCtx.waitUntil(logger.postRequest())
+    //const logger = new Logger(c.env.LogDNA, 'action.logger', org, source, logRequest, requestBody, name)
+    logger.defaultLogData = logger.buildDefaultLogData(name, org, source, logRequest, requestBody)
+    console.log(`Action ${name} called from ${org}`)
 
-  return fetch(request)
+    const response = await fetch(request)
+    const logResponse = response.clone() // a copy of the request is now stored in newRequest
+    const responseBody = debug ? await logResponse.text() : undefined
+
+    logger.setMeta('responseBody', responseBody)
+
+    if (logResponse.status < 400) console.log(`Action ${name} resulted in code ${logResponse.status}`)
+    else if (logResponse.status < 500) console.warn(`Action ${name} resulted in code ${logResponse.status}`)
+    else console.error(`Action ${name} resulted in code ${logResponse.status}`)
+
+    c.executionCtx.waitUntil(logger.postRequest())
+
+    return response
+  } catch (error) {
+    console.error(error)
+    return c.json(error, 500)
+  }
 })
 
 export default app
